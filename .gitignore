@@ -1,0 +1,8 @@
+.DS_Store
+.kilo/
+.vscode/
+Backups/
+**/Backups/
+*.zip
+*.7z
+*.rar
