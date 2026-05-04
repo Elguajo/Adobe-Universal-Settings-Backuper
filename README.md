@@ -16,16 +16,21 @@
 
 ## 🛠️ Быстрый старт
 
+### Root лаунчеры (самый простой способ)
+
+- macOS: двойной клик по `run-macos.command`
+- Windows: запуск `run-windows.cmd` (или `run-windows.cmd backup` / `run-windows.cmd restore "C:\path\to\backup"`)
+
 ### macOS (рекомендуется)
 
 1) Сделай файл исполняемым один раз:
 
 ```bash
-chmod +x macos/AdobeBuckper.command
+chmod +x macos/AdobeBackuper.command
 ```
 
 2) Запуск:
-- Двойной клик по `macos/AdobeBuckper.command`
+- Двойной клик по `macos/AdobeBackuper.command`
 - В меню выбери **Backup** или **Restore**
 
 > При восстановлении в системные директории (`/Applications`, `/Library/...`) скрипт сам запросит **admin password**.
@@ -85,8 +90,10 @@ windows\run-restore.cmd "windows\Backups\Adobe_Backup_2026-05-04_180000"
 
 ```
 Adobe-Universal-Settings-Backuper/
+├── run-macos.command
+├── run-windows.cmd
 ├── macos/
-│   └── AdobeBuckper.command
+│   └── AdobeBackuper.command
 ├── windows/
 │   ├── adobe-backup.ps1
 │   ├── run-backup.cmd

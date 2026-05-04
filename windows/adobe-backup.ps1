@@ -41,10 +41,11 @@ if ($mode -eq 'backup') {
 
 # "Smart exclusions" (similar spirit to macOS script)
 $junkDirExcludes = @(
-  "*Cache*", "*Caches*", "*Log*", "*Logs*", "*Temp*", "*tmp*"
+  "*Cache*", "*Caches*", "*Log*", "*Logs*", "*Temp*", "*tmp*",
+  "*Media Cache*", "*Media Cache Files*"
 )
 $junkFileExcludes = @(
-  "*.tmp", "*.lock", "*.log", "*.bak", "Thumbs.db", "desktop.ini"
+  "*.tmp", "*.lock", "*.log", "*.bak", "*.ds_store", "Thumbs.db", "desktop.ini"
 )
 
 # Standard Adobe plugin folders to ignore (custom-only backup)
@@ -53,8 +54,14 @@ $standardPluginDirExcludes = @(
   "Cineware by Maxon",
   "Effects",
   "Extensions",
+  "File Formats",
   "Format",
   "Keyframe"
+)
+
+# Optional: add your own excludes here (customize without editing logic below)
+$userPluginDirExcludes = @(
+  # "YourVendorPluginFolderName"
 )
 
 function Expand-Patterns {
@@ -166,10 +173,10 @@ if ($mode -eq 'backup') {
       $excludeFiles = $junkFileExcludes
 
       if ($app -eq "AfterEffects" -and $p -like "*\Plug-ins") {
-        $excludeDirs = @($excludeDirs + $standardPluginDirExcludes)
+        $excludeDirs = @($excludeDirs + $standardPluginDirExcludes + $userPluginDirExcludes)
       }
       if ($app -eq "Illustrator" -and $p -like "*\Plug-ins") {
-        $excludeDirs = @($excludeDirs + $standardPluginDirExcludes)
+        $excludeDirs = @($excludeDirs + $standardPluginDirExcludes + $userPluginDirExcludes)
       }
 
       $copied += (Backup-AbsolutePath -app $app -path $p -excludeDirs $excludeDirs -excludeFiles $excludeFiles)
