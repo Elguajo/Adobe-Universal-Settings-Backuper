@@ -57,9 +57,17 @@ windows\run-restore.cmd "windows\Backups\Adobe_Backup_2026-05-04_180000"
 
 # Restore
 .\windows\adobe-backup.ps1 -mode restore -dest ".\windows\Backups\Adobe_Backup_2026-05-04_180000"
+
+# Dry-run (ничего не копирует, только показывает что будет сделано)
+.\windows\adobe-backup.ps1 -mode restore -dest ".\windows\Backups\Adobe_Backup_2026-05-04_180000" -dryRun
+
+# Опасно: зеркальный restore с удалениями (включать только если понимаешь последствия)
+.\windows\adobe-backup.ps1 -mode restore -dest ".\windows\Backups\Adobe_Backup_2026-05-04_180000" -mirrorRestore
 ```
 
 > Для восстановления в `C:\Program Files\...` чаще всего нужно запустить PowerShell **от имени администратора**.
+>
+> По умолчанию restore работает в **safe**-режиме (без удалений). Для “точного слепка” с удалениями есть флаг `-mirrorRestore` (опасно).
 
 ---
 

@@ -42,6 +42,22 @@ PLUGIN_EXCLUDES=(
 # GUI HELPER FUNCTIONS
 # ==========================================
 
+function shell_quote() {
+    local s="$1"
+    s=${s//\'/\'\\\'\'}
+    printf "'%s'" "$s"
+}
+
+function run_admin_cmd() {
+    local cmd="$1"
+    osascript <<'APPLESCRIPT' "$cmd"
+on run argv
+  set cmd to item 1 of argv
+  do shell script cmd with administrator privileges
+end run
+APPLESCRIPT
+}
+
 function show_menu() {
     osascript <<EOD
     set question to display dialog "Adobe Manager v3.5\n\nBackup/Restore:\n- Preferences\n- Custom Plugins Only\n- ScriptUI Panels Only (No default scripts)\n\n(Cleanest possible backup)" buttons {"Cancel", "Restore", "Backup"} default button "Backup" with icon note
@@ -97,7 +113,7 @@ function do_backup() {
 
     # Backup Preferences Files
     echo "Backing up User Preferences..."
-    find "$PREFS" -maxdepth 1 -name "*Adobe*" | while read f; do
+    find "$PREFS" -maxdepth 1 -name "*Adobe*" -print0 | while IFS= read -r -d '' f; do
         rsync -a -v "${RSYNC_EXCLUDES[@]}" "$f" "$DEST_USER/Preferences/"
     done
 
@@ -107,7 +123,7 @@ function do_backup() {
     
     echo "Scanning Applications for Custom Plugins and ScriptUI Panels..."
     
-    find /Applications -maxdepth 2 -type d -name "Adobe *" | while read app_path; do
+    find /Applications -maxdepth 2 -type d -name "Adobe *" -print0 | while IFS= read -r -d '' app_path; do
         
         # A. PLUGINS (Exclude standard ones)
         if [ -d "$app_path/Plug-ins" ]; then
@@ -170,21 +186,46 @@ function do_restore() {
 
     # --- 2. Restore System Data (With Admin Privileges) ---
     local NEEDS_SUDO=false
-    local SUDO_CMD=""
+    local -a ADMIN_CMDS=()
 
     if [ -d "$SOURCE/System_Apps_Data" ]; then
         NEEDS_SUDO=true
-        SUDO_CMD="$SUDO_CMD rsync -a -v '${SOURCE}/System_Apps_Data/' /;"
+        # Safety checks: only allow restoring into /Applications via the saved structure.
+        if [ ! -d "$SOURCE/System_Apps_Data/Applications" ]; then
+            show_alert "Invalid backup structure.\nExpected: System_Apps_Data/Applications\n\nAborting restore."
+            exit 1
+        fi
+        if find "$SOURCE/System_Apps_Data" -mindepth 1 -maxdepth 1 -type d ! -name "Applications" -print -quit | grep -q .; then
+            show_alert "Invalid backup structure.\nSystem_Apps_Data contains unexpected top-level folders.\n\nAborting restore."
+            exit 1
+        fi
+        # Intentionally no exclude patterns here: safer quoting and predictable restore target.
+        ADMIN_CMDS+=("rsync -a -v $(shell_quote "$SOURCE/System_Apps_Data/Applications/") $(shell_quote "/Applications/")")
     fi
 
     if [ -d "$SOURCE/System_Library_Adobe" ]; then
         NEEDS_SUDO=true
-        SUDO_CMD="$SUDO_CMD rsync -a -v '${SOURCE}/System_Library_Adobe/' '/Library/Application Support/Adobe/';"
+        if [ ! -d "$SOURCE/System_Library_Adobe" ]; then
+            show_alert "Invalid backup structure.\nExpected: System_Library_Adobe\n\nAborting restore."
+            exit 1
+        fi
+        # Intentionally no exclude patterns here: safer quoting and predictable restore target.
+        ADMIN_CMDS+=("rsync -a -v $(shell_quote "$SOURCE/System_Library_Adobe/") $(shell_quote "/Library/Application Support/Adobe/")")
     fi
 
     if [ "$NEEDS_SUDO" = true ]; then
         echo "Restoring System Scripts/Plugins..."
-        osascript -e "do shell script \"$SUDO_CMD\" with administrator privileges"
+        # Build one command string for a single admin prompt.
+        local joined=""
+        local c
+        for c in "${ADMIN_CMDS[@]}"; do
+            if [ -n "$joined" ]; then
+                joined="$joined; $c"
+            else
+                joined="$c"
+            fi
+        done
+        run_admin_cmd "$joined"
     fi
 
     show_success "Restore Complete!\nCustom plugins and ScriptUI Panels restored."

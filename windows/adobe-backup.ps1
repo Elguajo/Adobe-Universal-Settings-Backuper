@@ -1,32 +1,64 @@
 param(
   [ValidateSet('backup','restore')]$mode = 'backup',
-  [string]$dest = "$PSScriptRoot\Backups"
+  [string]$dest = "$PSScriptRoot\Backups",
+  [switch]$dryRun,
+  # Dangerous for restore: mirrors and may delete files in destination.
+  [switch]$mirrorRestore
 )
 
 $ErrorActionPreference = "Stop"
+
+function Invoke-Robocopy {
+  param(
+    [Parameter(Mandatory=$true)][string[]]$args,
+    [string]$logFile = $null
+  )
+
+  if ($logFile) {
+    $logDir = Split-Path -Parent $logFile
+    if ($logDir) { New-Item -Force -ItemType Directory -Path $logDir | Out-Null }
+    $args += "/LOG+:$logFile"
+  }
+
+  & robocopy @args
+  # Robocopy uses bitmask exit codes; >=8 indicates failure.
+  $rc = $LASTEXITCODE
+  if ($rc -ge 8) {
+    throw "Robocopy failed with exit code $rc. See log: $logFile"
+  }
+  return $rc
+}
 
 function Copy-Safe {
   param(
     [Parameter(Mandatory=$true)][string]$src,
     [Parameter(Mandatory=$true)][string]$dst,
     [string[]]$excludeDirs = @(),
-    [string[]]$excludeFiles = @()
+    [string[]]$excludeFiles = @(),
+    [switch]$mirror,
+    [switch]$listOnly,
+    [string]$logFile = $null
   )
 
   if (-not (Test-Path -LiteralPath $src)) { return }
   New-Item -Force -ItemType Directory -Path $dst | Out-Null
 
+  # For restore we default to non-destructive copy: /E (include subdirs, including empty).
+  # Mirror mode is for backup (safe into new folder) or explicit restore when user accepts deletions.
+  $copyMode = if ($mirror) { "/MIR" } else { "/E" }
+
   $args = @(
     $src, $dst,
-    "/MIR", "/R:1", "/W:1",
+    $copyMode, "/R:1", "/W:1",
     "/NFL", "/NDL", "/NJH", "/NJS", "/NP",
     "/XJ"
   )
 
+  if ($listOnly) { $args += "/L" }
   if ($excludeDirs.Count -gt 0)  { $args += "/XD"; $args += $excludeDirs }
   if ($excludeFiles.Count -gt 0) { $args += "/XF"; $args += $excludeFiles }
 
-  & robocopy @args | Out-Null
+  [void](Invoke-Robocopy -args $args -logFile $logFile)
 }
 
 $stamp = Get-Date -Format "yyyy-MM-dd_HHmmss"
@@ -38,6 +70,9 @@ if ($mode -eq 'backup') {
 } else {
   $backupRoot = $dest
 }
+
+# Logs
+$logPath = Join-Path $backupRoot (Join-Path "logs" ("robocopy_" + $mode + "_" + $stamp + ".log"))
 
 # "Smart exclusions" (similar spirit to macOS script)
 $junkDirExcludes = @(
@@ -96,7 +131,7 @@ function Backup-AbsolutePath {
   }
 
   $dst = Join-Path $backupRoot (Join-Path $app (Join-Path ("Drive_" + $drive) $tail))
-  Copy-Safe -src $path -dst $dst -excludeDirs $excludeDirs -excludeFiles $excludeFiles
+  Copy-Safe -src $path -dst $dst -excludeDirs $excludeDirs -excludeFiles $excludeFiles -mirror -listOnly:$dryRun -logFile $logPath
   return 1
 }
 
@@ -121,7 +156,7 @@ function Restore-FromBackupRoot {
       $name = $_.Name
       $src  = $_.FullName
       $dst  = Join-Path $targetBase $name
-      Copy-Safe -src $src -dst $dst
+      Copy-Safe -src $src -dst $dst -mirror:$mirrorRestore -listOnly:$dryRun -logFile $logPath
       $copied++
     }
   }
@@ -189,11 +224,14 @@ if ($mode -eq 'backup') {
     note    = "Adobe Universal Settings Backuper v3 Windows backup (custom plugins, ScriptUI Panels, CEP; smart excludes)."
     itemsCopied = $copied
     apps    = $Selections.Keys
+    dryRun  = [bool]$dryRun
+    log     = (Split-Path -Leaf $logPath)
   }
   $metaPath = Join-Path $backupRoot "meta.json"
-  $meta | ConvertTo-Json | Out-File -Encoding UTF8 $metaPath
+  $meta | ConvertTo-Json -Depth 6 | Out-File -Encoding UTF8 $metaPath
 
   Write-Host "Backup complete: $backupRoot  (items: $copied)"
+  Write-Host "Robocopy log: $logPath"
 } else {
   if (-not (Test-Path -LiteralPath $backupRoot)) {
     Write-Error "Backup folder not found: $backupRoot"
@@ -205,5 +243,9 @@ if ($mode -eq 'backup') {
     $total += (Restore-FromBackupRoot -appRoot $_.FullName)
   }
 
-  Write-Host "Restore complete (top-level mirrors: $total). Note: writing to Program Files may require running PowerShell as Administrator."
+  Write-Host "Restore complete (top-level roots: $total). Note: writing to Program Files may require running PowerShell as Administrator."
+  Write-Host "Robocopy log: $logPath"
+  if (-not $mirrorRestore) {
+    Write-Host "Restore mode: safe copy (no deletions). Use -mirrorRestore to mirror (dangerous)."
+  }
 }
