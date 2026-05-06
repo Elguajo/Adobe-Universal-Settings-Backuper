@@ -77,6 +77,164 @@ function show_success() {
     osascript -e "display dialog \"$1\" buttons {\"OK\"} default button \"OK\" with icon note"
 }
 
+function format_bytes() {
+    local bytes="$1"
+    awk -v bytes="$bytes" 'BEGIN {
+        split("B KB MB GB TB", units, " ")
+        size = bytes + 0
+        unit = 1
+        while (size >= 1024 && unit < 5) {
+            size = size / 1024
+            unit++
+        }
+        if (unit == 1) {
+            printf "%d %s", size, units[unit]
+        } else {
+            printf "%.1f %s", size, units[unit]
+        }
+    }'
+}
+
+function scan_path_stats() {
+    local path="$1"
+    shift
+    local excludes=("$@")
+    local find_args=("$path")
+    local exclude
+
+    for exclude in "${excludes[@]}"; do
+        local pattern="${exclude#--exclude=}"
+        pattern="${pattern%\"}"
+        pattern="${pattern#\"}"
+        find_args+=( -name "$pattern" -prune -o )
+    done
+
+    find "${find_args[@]}" -type f -print0 2>/dev/null | \
+    awk -v RS='\0' '
+        BEGIN { files = 0; bytes = 0 }
+        {
+            quoted = $0
+            gsub(/\047/, "\047\\\047\047", quoted)
+            cmd = "stat -f %z \047" quoted "\047"
+            if ((cmd | getline size) > 0) {
+                files++
+                bytes += size
+            }
+            close(cmd)
+        }
+        END { printf "%d\t%d\n", files, bytes }
+    '
+}
+
+function scan_add_item() {
+    local category="$1"
+    local source="$2"
+    local destination="$3"
+    shift 3
+
+    if [ ! -e "$source" ]; then
+        return
+    fi
+
+    local stats files bytes
+    stats=$(scan_path_stats "$source" "$@")
+    files=${stats%%$'\t'*}
+    bytes=${stats##*$'\t'}
+
+    if [ "${files:-0}" -eq 0 ]; then
+        return
+    fi
+
+    SCAN_TOTAL_FILES=$((SCAN_TOTAL_FILES + files))
+    SCAN_TOTAL_BYTES=$((SCAN_TOTAL_BYTES + bytes))
+    SCAN_ITEM_COUNT=$((SCAN_ITEM_COUNT + 1))
+
+    printf '%s\t%s\t%s\t%s\t%s\n' "$category" "$source" "$destination" "$files" "$bytes" >> "$SCAN_REPORT_FILE"
+}
+
+function build_backup_scan() {
+    SCAN_REPORT_FILE=$(mktemp "${TMPDIR:-/tmp}/adobe-backup-scan.XXXXXX")
+    SCAN_TOTAL_FILES=0
+    SCAN_TOTAL_BYTES=0
+    SCAN_ITEM_COUNT=0
+
+    local APP_SUPPORT="$HOME/Library/Application Support/Adobe"
+    local PREFS="$HOME/Library/Preferences"
+    local DEST_USER="$CURRENT_BACKUP_FOLDER/User_Library"
+    local DEST_SYSTEM="$CURRENT_BACKUP_FOLDER/System_Apps_Data"
+    local SYS_LIB_ADOBE="/Library/Application Support/Adobe"
+    local DEST_SYS_LIB="$CURRENT_BACKUP_FOLDER/System_Library_Adobe"
+    local INSTALLED_ADOBE_PREF_KEYS
+    IFS=$'\n' read -r -d '' -a INSTALLED_ADOBE_PREF_KEYS < <(installed_adobe_preference_keys && printf '\0')
+
+    scan_add_item "User Application Support" "$APP_SUPPORT" "$DEST_USER/Application Support/Adobe" "${RSYNC_EXCLUDES[@]}"
+
+    while IFS= read -r -d '' f; do
+        if should_backup_adobe_preference "$f"; then
+            scan_add_item "User Preferences" "$f" "$DEST_USER/Preferences/$(basename "$f")" "${RSYNC_EXCLUDES[@]}"
+        fi
+    done < <(find "$PREFS" -maxdepth 1 -name "*Adobe*" -print0 2>/dev/null)
+
+    while IFS= read -r -d '' app_path; do
+        if [ -d "$app_path/Plug-ins" ]; then
+            scan_add_item "App Plug-ins" "$app_path/Plug-ins" "$DEST_SYSTEM$app_path/Plug-ins" "${RSYNC_EXCLUDES[@]}" "${PLUGIN_EXCLUDES[@]}"
+        fi
+
+        if [ -d "$app_path/Scripts/ScriptUI Panels" ]; then
+            scan_add_item "ScriptUI Panels" "$app_path/Scripts/ScriptUI Panels" "$DEST_SYSTEM$app_path/Scripts/ScriptUI Panels" "${RSYNC_EXCLUDES[@]}"
+        fi
+    done < <(find /Applications -maxdepth 2 -type d -name "Adobe *" -print0 2>/dev/null)
+
+    scan_add_item "System Common Plug-ins" "$SYS_LIB_ADOBE/Common/Plug-ins" "$DEST_SYS_LIB/Common/Plug-ins" "${RSYNC_EXCLUDES[@]}"
+    scan_add_item "System CEP" "$SYS_LIB_ADOBE/CEP" "$DEST_SYS_LIB/CEP" "${RSYNC_EXCLUDES[@]}"
+}
+
+function show_backup_preview() {
+    local total_size
+    total_size=$(format_bytes "$SCAN_TOTAL_BYTES")
+
+    local preview line shown=0
+    printf -v preview 'Preflight scan complete.\n\nWill backup: %s locations\nFiles: %s\nEstimated size: %s\nDestination:\n%s\n' \
+        "$SCAN_ITEM_COUNT" "$SCAN_TOTAL_FILES" "$total_size" "$CURRENT_BACKUP_FOLDER"
+
+    while IFS=$'\t' read -r category source destination files bytes; do
+        if [ "$shown" -ge 8 ]; then
+            preview="${preview}"$'\n'"...and more locations in Terminal output."
+            break
+        fi
+
+        printf -v line '\n%s\n%s / %s files\nFrom: %s\nTo: %s\n' \
+            "$category" "$(format_bytes "$bytes")" "$files" "$source" "$destination"
+        preview="${preview}${line}"
+        shown=$((shown + 1))
+    done < "$SCAN_REPORT_FILE"
+
+    osascript <<'APPLESCRIPT' "$preview"
+on run argv
+  set previewText to item 1 of argv
+  set answer to display dialog previewText buttons {"Cancel", "Backup"} default button "Backup" with icon note
+  return button returned of answer
+end run
+APPLESCRIPT
+}
+
+function print_backup_scan_tsv() {
+    build_backup_scan
+    printf 'category\tsource\tdestination\tfiles\tbytes\n'
+    cat "$SCAN_REPORT_FILE"
+    rm -f "$SCAN_REPORT_FILE"
+}
+
+function should_include_backup_source() {
+    local source="$1"
+
+    if [ -z "${ADOBE_BACKUP_SELECTION_FILE:-}" ]; then
+        return 0
+    fi
+
+    grep -Fxq "$source" "$ADOBE_BACKUP_SELECTION_FILE"
+}
+
 function is_noise_preference() {
     local name
     name=$(basename "$1")
@@ -215,6 +373,32 @@ function restore_from_manifest() {
 
 function do_backup() {
     echo "--- Starting Backup ---"
+    if [ "${ADOBE_BACKUP_HEADLESS:-false}" != "true" ]; then
+        echo "Scanning backup candidates..."
+        build_backup_scan
+
+        if [ "$SCAN_ITEM_COUNT" -eq 0 ]; then
+            show_alert "Nothing to backup.\nNo matching Adobe settings, custom plugins, or ScriptUI Panels were found."
+            rm -f "$SCAN_REPORT_FILE"
+            return
+        fi
+
+        echo "Preflight scan:"
+        while IFS=$'\t' read -r category source destination files bytes; do
+            echo "- $category: $(format_bytes "$bytes"), $files files"
+            echo "  From: $source"
+            echo "  To:   $destination"
+        done < "$SCAN_REPORT_FILE"
+        echo "Total: $(format_bytes "$SCAN_TOTAL_BYTES"), $SCAN_TOTAL_FILES files, $SCAN_ITEM_COUNT locations"
+
+        if [[ "$(show_backup_preview)" != "Backup" ]]; then
+            rm -f "$SCAN_REPORT_FILE"
+            echo "Backup cancelled after preflight scan."
+            exit 0
+        fi
+
+        rm -f "$SCAN_REPORT_FILE"
+    fi
     manifest_init
     
     # --- 1. User Library Settings ---
@@ -228,7 +412,7 @@ function do_backup() {
     mkdir -p "$DEST_USER/Preferences"
 
     # Backup Main Adobe Support
-    if [ -d "$APP_SUPPORT" ]; then
+    if [ -d "$APP_SUPPORT" ] && should_include_backup_source "$APP_SUPPORT"; then
         echo "Backing up User Application Support..."
         rsync -a -v "${RSYNC_EXCLUDES[@]}" "$APP_SUPPORT" "$DEST_USER/Application Support/"
         manifest_add "$DEST_USER/Application Support/Adobe" "$HOME/Library/Application Support/" false
@@ -237,7 +421,7 @@ function do_backup() {
     # Backup Preferences Files
     echo "Backing up User Preferences..."
     find "$PREFS" -maxdepth 1 -name "*Adobe*" -print0 | while IFS= read -r -d '' f; do
-        if should_backup_adobe_preference "$f"; then
+        if should_backup_adobe_preference "$f" && should_include_backup_source "$f"; then
             rsync -a -v "${RSYNC_EXCLUDES[@]}" "$f" "$DEST_USER/Preferences/"
             manifest_add "$DEST_USER/Preferences/$(basename "$f")" "$HOME/Library/Preferences/" false
         else
@@ -254,7 +438,7 @@ function do_backup() {
     find /Applications -maxdepth 2 -type d -name "Adobe *" -print0 | while IFS= read -r -d '' app_path; do
         
         # A. PLUGINS (Exclude standard ones)
-        if [ -d "$app_path/Plug-ins" ]; then
+        if [ -d "$app_path/Plug-ins" ] && should_include_backup_source "$app_path/Plug-ins"; then
             echo "Found Plugins: $app_path"
             mkdir -p "$DEST_SYSTEM$app_path" 
             rsync -a -v "${RSYNC_EXCLUDES[@]}" "${PLUGIN_EXCLUDES[@]}" "$app_path/Plug-ins" "$DEST_SYSTEM$app_path/"
@@ -263,7 +447,7 @@ function do_backup() {
 
         # B. SCRIPTS (ONLY ScriptUI Panels)
         # We specifically target the "ScriptUI Panels" folder inside Scripts
-        if [ -d "$app_path/Scripts/ScriptUI Panels" ]; then
+        if [ -d "$app_path/Scripts/ScriptUI Panels" ] && should_include_backup_source "$app_path/Scripts/ScriptUI Panels"; then
             echo "Found ScriptUI Panels: $app_path"
             # Create structure: AppName/Scripts/
             mkdir -p "$DEST_SYSTEM$app_path/Scripts"
@@ -277,30 +461,32 @@ function do_backup() {
     local SYS_LIB_ADOBE="/Library/Application Support/Adobe"
     local DEST_SYS_LIB="$CURRENT_BACKUP_FOLDER/System_Library_Adobe"
     
-    if [ -d "$SYS_LIB_ADOBE/Common/Plug-ins" ]; then
+    if [ -d "$SYS_LIB_ADOBE/Common/Plug-ins" ] && should_include_backup_source "$SYS_LIB_ADOBE/Common/Plug-ins"; then
         echo "Backing up MediaCore Plugins..."
         mkdir -p "$DEST_SYS_LIB/Common"
         rsync -a -v "${RSYNC_EXCLUDES[@]}" "$SYS_LIB_ADOBE/Common/Plug-ins" "$DEST_SYS_LIB/Common/"
         manifest_add "$DEST_SYS_LIB/Common/Plug-ins" "/Library/Application Support/Adobe/Common/" true
     fi
 
-    if [ -d "$SYS_LIB_ADOBE/CEP" ]; then
+    if [ -d "$SYS_LIB_ADOBE/CEP" ] && should_include_backup_source "$SYS_LIB_ADOBE/CEP"; then
         echo "Backing up System CEP Extensions..."
         mkdir -p "$DEST_SYS_LIB"
         rsync -a -v "${RSYNC_EXCLUDES[@]}" "$SYS_LIB_ADOBE/CEP" "$DEST_SYS_LIB/"
         manifest_add "$DEST_SYS_LIB/CEP" "/Library/Application Support/Adobe/" true
     fi
 
-    show_success "Backup Complete!\nOnly custom plugins and ScriptUI Panels saved."
-    show_notification "Backup Successful"
+    if [ "${ADOBE_BACKUP_HEADLESS:-false}" != "true" ]; then
+        show_success "Backup Complete!\nOnly custom plugins and ScriptUI Panels saved."
+        show_notification "Backup Successful"
+    fi
 }
 
 # ==========================================
 # RESTORE LOGIC
 # ==========================================
 
-function do_restore() {
-    local SOURCE=$(select_folder)
+function do_restore_from_source() {
+    local SOURCE="$1"
     if [[ "$SOURCE" == "UserCanceled" ]]; then exit 0; fi
 
     echo "--- Starting Restore ---"
@@ -322,8 +508,10 @@ function do_restore() {
             run_admin_cmd "$joined"
         fi
 
-        show_success "Restore Complete!\nManifest-based restore completed."
-        show_notification "Restore Successful"
+        if [ "${ADOBE_BACKUP_HEADLESS:-false}" != "true" ]; then
+            show_success "Restore Complete!\nManifest-based restore completed."
+            show_notification "Restore Successful"
+        fi
         return
     fi
 
@@ -381,8 +569,15 @@ function do_restore() {
         run_admin_cmd "$joined"
     fi
 
-    show_success "Restore Complete!\nCustom plugins and ScriptUI Panels restored."
-    show_notification "Restore Successful"
+    if [ "${ADOBE_BACKUP_HEADLESS:-false}" != "true" ]; then
+        show_success "Restore Complete!\nCustom plugins and ScriptUI Panels restored."
+        show_notification "Restore Successful"
+    fi
+}
+
+function do_restore() {
+    local SOURCE=$(select_folder)
+    do_restore_from_source "$SOURCE"
 }
 
 # ==========================================
@@ -393,6 +588,28 @@ if ! command -v rsync &> /dev/null; then
     show_alert "Error: rsync not found."
     exit 1
 fi
+
+case "${1:-}" in
+    --scan-backup-tsv)
+        print_backup_scan_tsv
+        exit 0
+        ;;
+    --backup-headless)
+        if [ -n "${2:-}" ]; then
+            ADOBE_BACKUP_SELECTION_FILE="$2"
+        fi
+        ADOBE_BACKUP_HEADLESS=true do_backup
+        exit 0
+        ;;
+    --restore-headless)
+        if [ -z "${2:-}" ]; then
+            echo "Restore source is required."
+            exit 1
+        fi
+        ADOBE_BACKUP_HEADLESS=true do_restore_from_source "$2"
+        exit 0
+        ;;
+esac
 
 SELECTION=$(show_menu)
 
