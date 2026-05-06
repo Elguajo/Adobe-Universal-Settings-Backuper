@@ -77,6 +77,67 @@ function show_success() {
     osascript -e "display dialog \"$1\" buttons {\"OK\"} default button \"OK\" with icon note"
 }
 
+function is_noise_preference() {
+    local name
+    name=$(basename "$1")
+
+    case "$name" in
+        com.adobe.*.plist|\
+        *"Creative Cloud"*|*"CoreSync"*|*"CCXProcess"*|*"AdobeGCClient"*|\
+        *"Updater"*|*"Update"*|*"Sync"*|*"MRU"*|*"Recent"*)
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+function installed_adobe_preference_keys() {
+    find /Applications -maxdepth 3 \( -type d -name "Adobe *.app" -o -type d -name "Adobe *" \) -print0 2>/dev/null | \
+    while IFS= read -r -d '' item; do
+        local name
+        name=$(basename "$item" .app)
+
+        case "$name" in
+            *"Creative Cloud"*|*"Updater"*|*"Update"*|*"CoreSync"*|*"CCXProcess"*)
+                continue
+                ;;
+        esac
+
+        printf '%s\n' "$name"
+
+        local info_plist="$item/Contents/Info.plist"
+        if [ -f "$info_plist" ]; then
+            local major_version product_key
+            major_version=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$info_plist" 2>/dev/null | cut -d. -f1)
+            product_key=$(printf '%s\n' "$name" | sed -E 's/[[:space:]][0-9]{4}$//')
+
+            if [ -n "$major_version" ] && [ -n "$product_key" ]; then
+                printf '%s %s\n' "$product_key" "$major_version"
+            fi
+        fi
+    done | sort -u
+}
+
+function should_backup_adobe_preference() {
+    local path="$1"
+    local name
+    name=$(basename "$path")
+
+    if is_noise_preference "$path"; then
+        return 1
+    fi
+
+    if [ -d "$path" ] && [[ "$name" == Adobe*" Settings" ]]; then
+        local settings_key="${name% Settings}"
+        if ! printf '%s\n' "${INSTALLED_ADOBE_PREF_KEYS[@]}" | grep -Fxq "$settings_key"; then
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
 function select_folder() {
     if [ ! -d "$BACKUP_ROOT" ]; then mkdir -p "$BACKUP_ROOT"; fi
     osascript <<EOD
@@ -90,17 +151,78 @@ function select_folder() {
 EOD
 }
 
+function manifest_init() {
+    MANIFEST_FILE="$CURRENT_BACKUP_FOLDER/manifest.tsv"
+    META_FILE="$CURRENT_BACKUP_FOLDER/meta.tsv"
+
+    mkdir -p "$CURRENT_BACKUP_FOLDER"
+    printf 'backup_path\trestore_parent\tadmin\n' > "$MANIFEST_FILE"
+    printf 'created\t%s\n' "$TIMESTAMP" > "$META_FILE"
+    printf 'host\t%s\n' "$(scutil --get ComputerName 2>/dev/null || hostname)" >> "$META_FILE"
+}
+
+function manifest_path() {
+    local path="$1"
+    path="${path%/}"
+    printf '%s' "${path#"$CURRENT_BACKUP_FOLDER"/}"
+}
+
+function manifest_add() {
+    local backup_path="$1"
+    local restore_parent="$2"
+    local admin="$3"
+
+    printf '%s\t%s\t%s\n' "$(manifest_path "$backup_path")" "$restore_parent" "$admin" >> "$MANIFEST_FILE"
+}
+
+function restore_manifest_item() {
+    local source_root="$1"
+    local backup_path="$2"
+    local restore_parent="$3"
+    local admin="$4"
+
+    local source_path="$source_root/$backup_path"
+    if [ ! -e "$source_path" ]; then
+        echo "Skipping missing manifest item: $source_path"
+        return
+    fi
+
+    if [ "$admin" = "true" ]; then
+        ADMIN_CMDS+=("rsync -a -v $(shell_quote "$source_path") $(shell_quote "$restore_parent")")
+    else
+        rsync -a -v "$source_path" "$restore_parent"
+    fi
+}
+
+function restore_from_manifest() {
+    local source_root="$1"
+    local manifest="$source_root/manifest.tsv"
+
+    if [ ! -f "$manifest" ]; then
+        return 1
+    fi
+
+    while IFS=$'\t' read -r backup_path restore_parent admin; do
+        restore_manifest_item "$source_root" "$backup_path" "$restore_parent" "$admin"
+    done < <(tail -n +2 "$manifest")
+
+    return 0
+}
+
 # ==========================================
 # BACKUP LOGIC
 # ==========================================
 
 function do_backup() {
     echo "--- Starting Backup ---"
+    manifest_init
     
     # --- 1. User Library Settings ---
     local APP_SUPPORT="$HOME/Library/Application Support/Adobe"
     local PREFS="$HOME/Library/Preferences"
     local DEST_USER="$CURRENT_BACKUP_FOLDER/User_Library"
+    local INSTALLED_ADOBE_PREF_KEYS
+    IFS=$'\n' read -r -d '' -a INSTALLED_ADOBE_PREF_KEYS < <(installed_adobe_preference_keys && printf '\0')
     
     mkdir -p "$DEST_USER/Application Support"
     mkdir -p "$DEST_USER/Preferences"
@@ -109,12 +231,18 @@ function do_backup() {
     if [ -d "$APP_SUPPORT" ]; then
         echo "Backing up User Application Support..."
         rsync -a -v "${RSYNC_EXCLUDES[@]}" "$APP_SUPPORT" "$DEST_USER/Application Support/"
+        manifest_add "$DEST_USER/Application Support/Adobe" "$HOME/Library/Application Support/" false
     fi
 
     # Backup Preferences Files
     echo "Backing up User Preferences..."
     find "$PREFS" -maxdepth 1 -name "*Adobe*" -print0 | while IFS= read -r -d '' f; do
-        rsync -a -v "${RSYNC_EXCLUDES[@]}" "$f" "$DEST_USER/Preferences/"
+        if should_backup_adobe_preference "$f"; then
+            rsync -a -v "${RSYNC_EXCLUDES[@]}" "$f" "$DEST_USER/Preferences/"
+            manifest_add "$DEST_USER/Preferences/$(basename "$f")" "$HOME/Library/Preferences/" false
+        else
+            echo "Skipping noise/stale preference: $f"
+        fi
     done
 
     # --- 2. System Wide Items (Plugins/Scripts in Applications) ---
@@ -130,6 +258,7 @@ function do_backup() {
             echo "Found Plugins: $app_path"
             mkdir -p "$DEST_SYSTEM$app_path" 
             rsync -a -v "${RSYNC_EXCLUDES[@]}" "${PLUGIN_EXCLUDES[@]}" "$app_path/Plug-ins" "$DEST_SYSTEM$app_path/"
+            manifest_add "$DEST_SYSTEM$app_path/Plug-ins" "$app_path/" true
         fi
 
         # B. SCRIPTS (ONLY ScriptUI Panels)
@@ -140,6 +269,7 @@ function do_backup() {
             mkdir -p "$DEST_SYSTEM$app_path/Scripts"
             # Backup ONLY "ScriptUI Panels" folder
             rsync -a -v "${RSYNC_EXCLUDES[@]}" "$app_path/Scripts/ScriptUI Panels" "$DEST_SYSTEM$app_path/Scripts/"
+            manifest_add "$DEST_SYSTEM$app_path/Scripts/ScriptUI Panels" "$app_path/Scripts/" true
         fi
     done
 
@@ -151,12 +281,14 @@ function do_backup() {
         echo "Backing up MediaCore Plugins..."
         mkdir -p "$DEST_SYS_LIB/Common"
         rsync -a -v "${RSYNC_EXCLUDES[@]}" "$SYS_LIB_ADOBE/Common/Plug-ins" "$DEST_SYS_LIB/Common/"
+        manifest_add "$DEST_SYS_LIB/Common/Plug-ins" "/Library/Application Support/Adobe/Common/" true
     fi
 
     if [ -d "$SYS_LIB_ADOBE/CEP" ]; then
         echo "Backing up System CEP Extensions..."
         mkdir -p "$DEST_SYS_LIB"
         rsync -a -v "${RSYNC_EXCLUDES[@]}" "$SYS_LIB_ADOBE/CEP" "$DEST_SYS_LIB/"
+        manifest_add "$DEST_SYS_LIB/CEP" "/Library/Application Support/Adobe/" true
     fi
 
     show_success "Backup Complete!\nOnly custom plugins and ScriptUI Panels saved."
@@ -173,6 +305,28 @@ function do_restore() {
 
     echo "--- Starting Restore ---"
 
+    local -a ADMIN_CMDS=()
+
+    if restore_from_manifest "$SOURCE"; then
+        if [ "${#ADMIN_CMDS[@]}" -gt 0 ]; then
+            echo "Restoring privileged manifest items..."
+            local joined=""
+            local c
+            for c in "${ADMIN_CMDS[@]}"; do
+                if [ -n "$joined" ]; then
+                    joined="$joined; $c"
+                else
+                    joined="$c"
+                fi
+            done
+            run_admin_cmd "$joined"
+        fi
+
+        show_success "Restore Complete!\nManifest-based restore completed."
+        show_notification "Restore Successful"
+        return
+    fi
+
     # --- 1. Restore User Data ---
     if [ -d "$SOURCE/User_Library/Application Support/Adobe" ]; then
         echo "Restoring User Settings..."
@@ -186,7 +340,6 @@ function do_restore() {
 
     # --- 2. Restore System Data (With Admin Privileges) ---
     local NEEDS_SUDO=false
-    local -a ADMIN_CMDS=()
 
     if [ -d "$SOURCE/System_Apps_Data" ]; then
         NEEDS_SUDO=true
