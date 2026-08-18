@@ -75,7 +75,9 @@ windows\run-restore.cmd "windows\Backups\Adobe_Backup_2026-05-04_180000"
 
 ### macOS
 - `~/Library/Application Support/Adobe`
-- `~/Library/Preferences` (только `*Adobe*` на верхнем уровне)
+- `~/Library/Preferences` (только `*Adobe*` на верхнем уровне, включая папки `Adobe <App> <version> Settings` — там же лежат сохранённые Workspaces для Photoshop/Illustrator)
+- `~/Documents/Adobe/Premiere Pro/*/Profile-*/Layouts` (+ `ArchivedLayouts`, `Mac`, `Win`) — сохранённые расклады интерфейса Premiere Pro
+- `~/Documents/Adobe/After Effects */User Presets`
 - `/Applications/Adobe */Plug-ins` (с исключениями стандартных)
 - `/Applications/Adobe */Scripts/ScriptUI Panels` (только панели)
 - `/Library/Application Support/Adobe/Common/Plug-ins`

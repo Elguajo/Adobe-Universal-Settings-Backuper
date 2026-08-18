@@ -58,6 +58,44 @@ end run
 APPLESCRIPT
 }
 
+# Runs rsync and records failures instead of letting them pass silently.
+# Sets BACKUP_HAD_ERRORS/RESTORE_HAD_ERRORS (whichever the caller uses) to 1 on failure.
+function run_rsync() {
+    local rc
+    rsync "$@"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "ERROR: rsync failed (exit $rc): rsync $*" >&2
+        return 1
+    fi
+    return 0
+}
+
+# Joins queued admin-privileged commands with && (so a failed step stops the rest instead
+# of silently continuing) and runs them behind a single admin prompt. Sets RESTORE_HAD_ERRORS
+# on failure. Takes the commands as positional args (macOS ships bash 3.2, no namerefs).
+function run_admin_cmds() {
+    if [ "$#" -eq 0 ]; then
+        return 0
+    fi
+
+    local joined="" c
+    for c in "$@"; do
+        if [ -n "$joined" ]; then
+            joined="$joined && $c"
+        else
+            joined="$c"
+        fi
+    done
+
+    if ! run_admin_cmd "$joined"; then
+        echo "ERROR: privileged restore command failed" >&2
+        RESTORE_HAD_ERRORS=1
+        return 1
+    fi
+    return 0
+}
+
 function show_menu() {
     osascript <<EOD
     set question to display dialog "Adobe Manager v3.5\n\nBackup/Restore:\n- Preferences\n- Custom Plugins Only\n- ScriptUI Panels Only (No default scripts)\n\n(Cleanest possible backup)" buttons {"Cancel", "Restore", "Backup"} default button "Backup" with icon note
@@ -109,21 +147,17 @@ function scan_path_stats() {
         find_args+=( -name "$pattern" -prune -o )
     done
 
-    find "${find_args[@]}" -type f -print0 2>/dev/null | \
-    awk -v RS='\0' '
-        BEGIN { files = 0; bytes = 0 }
-        {
-            quoted = $0
-            gsub(/\047/, "\047\\\047\047", quoted)
-            cmd = "stat -f %z \047" quoted "\047"
-            if ((cmd | getline size) > 0) {
-                files++
-                bytes += size
-            }
-            close(cmd)
-        }
-        END { printf "%d\t%d\n", files, bytes }
-    '
+    # NOTE: macOS ships BWK awk (not gawk), which does not honor RS='\0' as a real NUL
+    # separator - it silently stops after the first record. That previously made this
+    # function undercount every multi-file folder down to "1 file". Batch stat via
+    # find's own -exec ... + instead, which needs no NUL-splitting at all.
+    local files=0 bytes=0 size
+    while IFS= read -r size; do
+        files=$((files + 1))
+        bytes=$((bytes + size))
+    done < <(find "${find_args[@]}" -type f -exec stat -f '%z' '{}' + 2>/dev/null)
+
+    printf '%d\t%d\n' "$files" "$bytes"
 }
 
 function scan_add_item() {
@@ -152,11 +186,12 @@ function scan_add_item() {
     printf '%s\t%s\t%s\t%s\t%s\n' "$category" "$source" "$destination" "$files" "$bytes" >> "$SCAN_REPORT_FILE"
 }
 
-function build_backup_scan() {
-    SCAN_REPORT_FILE=$(mktemp "${TMPDIR:-/tmp}/adobe-backup-scan.XXXXXX")
-    SCAN_TOTAL_FILES=0
-    SCAN_TOTAL_BYTES=0
-    SCAN_ITEM_COUNT=0
+# Single source of truth for "what gets backed up": walks every candidate item exactly
+# once and hands it to $callback as (category, source, destination, restore_parent, admin,
+# exclude_kind). Both the preflight scan and the real backup consume this so they can never
+# drift apart on which paths/excludes/selection-filter rules apply.
+function enumerate_backup_items() {
+    local callback="$1"
 
     local APP_SUPPORT="$HOME/Library/Application Support/Adobe"
     local PREFS="$HOME/Library/Preferences"
@@ -167,26 +202,96 @@ function build_backup_scan() {
     local INSTALLED_ADOBE_PREF_KEYS
     IFS=$'\n' read -r -d '' -a INSTALLED_ADOBE_PREF_KEYS < <(installed_adobe_preference_keys && printf '\0')
 
-    scan_add_item "User Application Support" "$APP_SUPPORT" "$DEST_USER/Application Support/Adobe" "${RSYNC_EXCLUDES[@]}"
+    if [ -e "$APP_SUPPORT" ] && should_include_backup_source "$APP_SUPPORT"; then
+        "$callback" "User Application Support" "$APP_SUPPORT" "$DEST_USER/Application Support/Adobe" "$HOME/Library/Application Support/" false standard
+    fi
 
     while IFS= read -r -d '' f; do
-        if should_backup_adobe_preference "$f"; then
-            scan_add_item "User Preferences" "$f" "$DEST_USER/Preferences/$(basename "$f")" "${RSYNC_EXCLUDES[@]}"
+        if ! should_backup_adobe_preference "$f"; then
+            echo "Skipping noise/stale preference: $f"
+        elif should_include_backup_source "$f"; then
+            "$callback" "User Preferences" "$f" "$DEST_USER/Preferences/$(basename "$f")" "$HOME/Library/Preferences/" false standard
         fi
     done < <(find "$PREFS" -maxdepth 1 -name "*Adobe*" -print0 2>/dev/null)
 
+    # ~/Documents/Adobe holds per-app workspace/layout data that lives outside
+    # ~/Library entirely (After Effects custom presets, Premiere Pro saved Layouts).
+    local DOCS_ADOBE="$HOME/Documents/Adobe"
+    local DEST_DOCS="$CURRENT_BACKUP_FOLDER/User_Documents"
+
+    while IFS= read -r -d '' ae_dir; do
+        if [ -d "$ae_dir/User Presets" ] && should_include_backup_source "$ae_dir/User Presets"; then
+            local ae_rel="${ae_dir#"$HOME/Documents/"}"
+            "$callback" "AE User Presets" "$ae_dir/User Presets" "$DEST_DOCS/$ae_rel/User Presets" "$ae_dir/" false standard
+        fi
+    done < <(find "$DOCS_ADOBE" -maxdepth 1 -type d -name "After Effects*" -print0 2>/dev/null)
+
+    while IFS= read -r -d '' profile_dir; do
+        local profile_rel="${profile_dir#"$HOME/Documents/"}"
+        local layout_sub
+        for layout_sub in Layouts ArchivedLayouts Mac Win; do
+            if [ -d "$profile_dir/$layout_sub" ] && should_include_backup_source "$profile_dir/$layout_sub"; then
+                "$callback" "Premiere Workspace ($layout_sub)" "$profile_dir/$layout_sub" "$DEST_DOCS/$profile_rel/$layout_sub" "$profile_dir/" false standard
+            fi
+        done
+    done < <(find "$DOCS_ADOBE/Premiere Pro" -mindepth 2 -maxdepth 2 -type d -name "Profile-*" -print0 2>/dev/null)
+
     while IFS= read -r -d '' app_path; do
-        if [ -d "$app_path/Plug-ins" ]; then
-            scan_add_item "App Plug-ins" "$app_path/Plug-ins" "$DEST_SYSTEM$app_path/Plug-ins" "${RSYNC_EXCLUDES[@]}" "${PLUGIN_EXCLUDES[@]}"
+        if [ -d "$app_path/Plug-ins" ] && should_include_backup_source "$app_path/Plug-ins"; then
+            "$callback" "App Plug-ins" "$app_path/Plug-ins" "$DEST_SYSTEM$app_path/Plug-ins" "$app_path/" true plugins
         fi
 
-        if [ -d "$app_path/Scripts/ScriptUI Panels" ]; then
-            scan_add_item "ScriptUI Panels" "$app_path/Scripts/ScriptUI Panels" "$DEST_SYSTEM$app_path/Scripts/ScriptUI Panels" "${RSYNC_EXCLUDES[@]}"
+        if [ -d "$app_path/Scripts/ScriptUI Panels" ] && should_include_backup_source "$app_path/Scripts/ScriptUI Panels"; then
+            "$callback" "ScriptUI Panels" "$app_path/Scripts/ScriptUI Panels" "$DEST_SYSTEM$app_path/Scripts/ScriptUI Panels" "$app_path/Scripts/" true standard
         fi
     done < <(find /Applications -maxdepth 2 -type d -name "Adobe *" -print0 2>/dev/null)
 
-    scan_add_item "System Common Plug-ins" "$SYS_LIB_ADOBE/Common/Plug-ins" "$DEST_SYS_LIB/Common/Plug-ins" "${RSYNC_EXCLUDES[@]}"
-    scan_add_item "System CEP" "$SYS_LIB_ADOBE/CEP" "$DEST_SYS_LIB/CEP" "${RSYNC_EXCLUDES[@]}"
+    if [ -e "$SYS_LIB_ADOBE/Common/Plug-ins" ] && should_include_backup_source "$SYS_LIB_ADOBE/Common/Plug-ins"; then
+        "$callback" "System Common Plug-ins" "$SYS_LIB_ADOBE/Common/Plug-ins" "$DEST_SYS_LIB/Common/Plug-ins" "/Library/Application Support/Adobe/Common/" true standard
+    fi
+
+    if [ -e "$SYS_LIB_ADOBE/CEP" ] && should_include_backup_source "$SYS_LIB_ADOBE/CEP"; then
+        "$callback" "System CEP" "$SYS_LIB_ADOBE/CEP" "$DEST_SYS_LIB/CEP" "/Library/Application Support/Adobe/" true standard
+    fi
+}
+
+function item_excludes() {
+    local exclude_kind="$1"
+    ITEM_EXCLUDES=("${RSYNC_EXCLUDES[@]}")
+    if [ "$exclude_kind" = "plugins" ]; then
+        ITEM_EXCLUDES+=("${PLUGIN_EXCLUDES[@]}")
+    fi
+}
+
+function scan_item_callback() {
+    local category="$1" source="$2" destination="$3"
+    local exclude_kind="$6"
+    local ITEM_EXCLUDES
+    item_excludes "$exclude_kind"
+    scan_add_item "$category" "$source" "$destination" "${ITEM_EXCLUDES[@]}"
+}
+
+function backup_item_callback() {
+    local category="$1" source="$2" destination="$3" restore_parent="$4" admin="$5" exclude_kind="$6"
+    local ITEM_EXCLUDES
+    item_excludes "$exclude_kind"
+
+    echo "Backing up $category: $source"
+    mkdir -p "$(dirname "$destination")"
+    if run_rsync -a -v "${ITEM_EXCLUDES[@]}" "$source" "$(dirname "$destination")/"; then
+        manifest_add "$destination" "$restore_parent" "$admin"
+    else
+        BACKUP_HAD_ERRORS=1
+    fi
+}
+
+function build_backup_scan() {
+    SCAN_REPORT_FILE=$(mktemp "${TMPDIR:-/tmp}/adobe-backup-scan.XXXXXX")
+    SCAN_TOTAL_FILES=0
+    SCAN_TOTAL_BYTES=0
+    SCAN_ITEM_COUNT=0
+
+    enumerate_backup_items scan_item_callback
 }
 
 function show_backup_preview() {
@@ -333,11 +438,57 @@ function manifest_add() {
     printf '%s\t%s\t%s\n' "$(manifest_path "$backup_path")" "$restore_parent" "$admin" >> "$MANIFEST_FILE"
 }
 
+function has_path_traversal() {
+    case "$1" in
+        ..|../*|*/../*|*/..) return 0 ;;
+    esac
+    return 1
+}
+
+function is_within_dir() {
+    local path="${1%/}"
+    local dir="${2%/}"
+    case "$path" in
+        "$dir"|"$dir"/*) return 0 ;;
+    esac
+    return 1
+}
+
+# Manifest entries drive privileged rsync destinations, so a manifest.tsv from an
+# untrusted/shared backup folder must not be able to point admin=true writes anywhere
+# it wants. Only allow the destinations this script itself ever writes into the manifest.
+function is_allowed_restore_target() {
+    local restore_parent="$1"
+    local admin="$2"
+
+    if [ "$admin" = "true" ]; then
+        is_within_dir "$restore_parent" "/Applications" && return 0
+        is_within_dir "$restore_parent" "/Library/Application Support/Adobe" && return 0
+        return 1
+    fi
+
+    is_within_dir "$restore_parent" "$HOME/Library" && return 0
+    is_within_dir "$restore_parent" "$HOME/Documents/Adobe" && return 0
+    return 1
+}
+
 function restore_manifest_item() {
     local source_root="$1"
     local backup_path="$2"
     local restore_parent="$3"
     local admin="$4"
+
+    if has_path_traversal "$backup_path"; then
+        echo "ERROR: Refusing manifest item with path traversal: $backup_path" >&2
+        RESTORE_HAD_ERRORS=1
+        return
+    fi
+
+    if ! is_allowed_restore_target "$restore_parent" "$admin"; then
+        echo "ERROR: Refusing manifest item with disallowed restore target: $restore_parent (admin=$admin)" >&2
+        RESTORE_HAD_ERRORS=1
+        return
+    fi
 
     local source_path="$source_root/$backup_path"
     if [ ! -e "$source_path" ]; then
@@ -348,7 +499,7 @@ function restore_manifest_item() {
     if [ "$admin" = "true" ]; then
         ADMIN_CMDS+=("rsync -a -v $(shell_quote "$source_path") $(shell_quote "$restore_parent")")
     else
-        rsync -a -v "$source_path" "$restore_parent"
+        run_rsync -a -v "$source_path" "$restore_parent" || RESTORE_HAD_ERRORS=1
     fi
 }
 
@@ -400,84 +551,21 @@ function do_backup() {
         rm -f "$SCAN_REPORT_FILE"
     fi
     manifest_init
-    
-    # --- 1. User Library Settings ---
-    local APP_SUPPORT="$HOME/Library/Application Support/Adobe"
-    local PREFS="$HOME/Library/Preferences"
-    local DEST_USER="$CURRENT_BACKUP_FOLDER/User_Library"
-    local INSTALLED_ADOBE_PREF_KEYS
-    IFS=$'\n' read -r -d '' -a INSTALLED_ADOBE_PREF_KEYS < <(installed_adobe_preference_keys && printf '\0')
-    
-    mkdir -p "$DEST_USER/Application Support"
-    mkdir -p "$DEST_USER/Preferences"
 
-    # Backup Main Adobe Support
-    if [ -d "$APP_SUPPORT" ] && should_include_backup_source "$APP_SUPPORT"; then
-        echo "Backing up User Application Support..."
-        rsync -a -v "${RSYNC_EXCLUDES[@]}" "$APP_SUPPORT" "$DEST_USER/Application Support/"
-        manifest_add "$DEST_USER/Application Support/Adobe" "$HOME/Library/Application Support/" false
-    fi
-
-    # Backup Preferences Files
-    echo "Backing up User Preferences..."
-    find "$PREFS" -maxdepth 1 -name "*Adobe*" -print0 | while IFS= read -r -d '' f; do
-        if should_backup_adobe_preference "$f" && should_include_backup_source "$f"; then
-            rsync -a -v "${RSYNC_EXCLUDES[@]}" "$f" "$DEST_USER/Preferences/"
-            manifest_add "$DEST_USER/Preferences/$(basename "$f")" "$HOME/Library/Preferences/" false
-        else
-            echo "Skipping noise/stale preference: $f"
-        fi
-    done
-
-    # --- 2. System Wide Items (Plugins/Scripts in Applications) ---
-    local DEST_SYSTEM="$CURRENT_BACKUP_FOLDER/System_Apps_Data"
-    mkdir -p "$DEST_SYSTEM"
-    
-    echo "Scanning Applications for Custom Plugins and ScriptUI Panels..."
-    
-    find /Applications -maxdepth 2 -type d -name "Adobe *" -print0 | while IFS= read -r -d '' app_path; do
-        
-        # A. PLUGINS (Exclude standard ones)
-        if [ -d "$app_path/Plug-ins" ] && should_include_backup_source "$app_path/Plug-ins"; then
-            echo "Found Plugins: $app_path"
-            mkdir -p "$DEST_SYSTEM$app_path" 
-            rsync -a -v "${RSYNC_EXCLUDES[@]}" "${PLUGIN_EXCLUDES[@]}" "$app_path/Plug-ins" "$DEST_SYSTEM$app_path/"
-            manifest_add "$DEST_SYSTEM$app_path/Plug-ins" "$app_path/" true
-        fi
-
-        # B. SCRIPTS (ONLY ScriptUI Panels)
-        # We specifically target the "ScriptUI Panels" folder inside Scripts
-        if [ -d "$app_path/Scripts/ScriptUI Panels" ] && should_include_backup_source "$app_path/Scripts/ScriptUI Panels"; then
-            echo "Found ScriptUI Panels: $app_path"
-            # Create structure: AppName/Scripts/
-            mkdir -p "$DEST_SYSTEM$app_path/Scripts"
-            # Backup ONLY "ScriptUI Panels" folder
-            rsync -a -v "${RSYNC_EXCLUDES[@]}" "$app_path/Scripts/ScriptUI Panels" "$DEST_SYSTEM$app_path/Scripts/"
-            manifest_add "$DEST_SYSTEM$app_path/Scripts/ScriptUI Panels" "$app_path/Scripts/" true
-        fi
-    done
-
-    # --- 3. System Library (Common Plugins/CEP) ---
-    local SYS_LIB_ADOBE="/Library/Application Support/Adobe"
-    local DEST_SYS_LIB="$CURRENT_BACKUP_FOLDER/System_Library_Adobe"
-    
-    if [ -d "$SYS_LIB_ADOBE/Common/Plug-ins" ] && should_include_backup_source "$SYS_LIB_ADOBE/Common/Plug-ins"; then
-        echo "Backing up MediaCore Plugins..."
-        mkdir -p "$DEST_SYS_LIB/Common"
-        rsync -a -v "${RSYNC_EXCLUDES[@]}" "$SYS_LIB_ADOBE/Common/Plug-ins" "$DEST_SYS_LIB/Common/"
-        manifest_add "$DEST_SYS_LIB/Common/Plug-ins" "/Library/Application Support/Adobe/Common/" true
-    fi
-
-    if [ -d "$SYS_LIB_ADOBE/CEP" ] && should_include_backup_source "$SYS_LIB_ADOBE/CEP"; then
-        echo "Backing up System CEP Extensions..."
-        mkdir -p "$DEST_SYS_LIB"
-        rsync -a -v "${RSYNC_EXCLUDES[@]}" "$SYS_LIB_ADOBE/CEP" "$DEST_SYS_LIB/"
-        manifest_add "$DEST_SYS_LIB/CEP" "/Library/Application Support/Adobe/" true
-    fi
+    BACKUP_HAD_ERRORS=0
+    enumerate_backup_items backup_item_callback
 
     if [ "${ADOBE_BACKUP_HEADLESS:-false}" != "true" ]; then
-        show_success "Backup Complete!\nOnly custom plugins and ScriptUI Panels saved."
-        show_notification "Backup Successful"
+        if [ "$BACKUP_HAD_ERRORS" -eq 0 ]; then
+            show_success "Backup Complete!\nOnly custom plugins and ScriptUI Panels saved."
+            show_notification "Backup Successful"
+        else
+            show_alert "Backup finished with errors.\nSome items failed to copy - check the Terminal output.\nDestination:\n$CURRENT_BACKUP_FOLDER"
+        fi
+    else
+        if [ "$BACKUP_HAD_ERRORS" -ne 0 ]; then
+            echo "Backup finished with errors." >&2
+        fi
     fi
 }
 
@@ -491,26 +579,22 @@ function do_restore_from_source() {
 
     echo "--- Starting Restore ---"
 
+    RESTORE_HAD_ERRORS=0
     local -a ADMIN_CMDS=()
 
     if restore_from_manifest "$SOURCE"; then
         if [ "${#ADMIN_CMDS[@]}" -gt 0 ]; then
             echo "Restoring privileged manifest items..."
-            local joined=""
-            local c
-            for c in "${ADMIN_CMDS[@]}"; do
-                if [ -n "$joined" ]; then
-                    joined="$joined; $c"
-                else
-                    joined="$c"
-                fi
-            done
-            run_admin_cmd "$joined"
+            run_admin_cmds "${ADMIN_CMDS[@]}"
         fi
 
         if [ "${ADOBE_BACKUP_HEADLESS:-false}" != "true" ]; then
-            show_success "Restore Complete!\nManifest-based restore completed."
-            show_notification "Restore Successful"
+            if [ "$RESTORE_HAD_ERRORS" -eq 0 ]; then
+                show_success "Restore Complete!\nManifest-based restore completed."
+                show_notification "Restore Successful"
+            else
+                show_alert "Restore finished with errors.\nSome items failed - check the Terminal output."
+            fi
         fi
         return
     fi
@@ -518,12 +602,12 @@ function do_restore_from_source() {
     # --- 1. Restore User Data ---
     if [ -d "$SOURCE/User_Library/Application Support/Adobe" ]; then
         echo "Restoring User Settings..."
-        rsync -a -v "${RSYNC_EXCLUDES[@]}" "$SOURCE/User_Library/Application Support/Adobe" "$HOME/Library/Application Support/"
+        run_rsync -a -v "${RSYNC_EXCLUDES[@]}" "$SOURCE/User_Library/Application Support/Adobe" "$HOME/Library/Application Support/" || RESTORE_HAD_ERRORS=1
     fi
 
     if [ -d "$SOURCE/User_Library/Preferences" ]; then
         echo "Restoring Preferences..."
-        rsync -a -v "${RSYNC_EXCLUDES[@]}" "$SOURCE/User_Library/Preferences/" "$HOME/Library/Preferences/"
+        run_rsync -a -v "${RSYNC_EXCLUDES[@]}" "$SOURCE/User_Library/Preferences/" "$HOME/Library/Preferences/" || RESTORE_HAD_ERRORS=1
     fi
 
     # --- 2. Restore System Data (With Admin Privileges) ---
@@ -556,22 +640,16 @@ function do_restore_from_source() {
 
     if [ "$NEEDS_SUDO" = true ]; then
         echo "Restoring System Scripts/Plugins..."
-        # Build one command string for a single admin prompt.
-        local joined=""
-        local c
-        for c in "${ADMIN_CMDS[@]}"; do
-            if [ -n "$joined" ]; then
-                joined="$joined; $c"
-            else
-                joined="$c"
-            fi
-        done
-        run_admin_cmd "$joined"
+        run_admin_cmds "${ADMIN_CMDS[@]}"
     fi
 
     if [ "${ADOBE_BACKUP_HEADLESS:-false}" != "true" ]; then
-        show_success "Restore Complete!\nCustom plugins and ScriptUI Panels restored."
-        show_notification "Restore Successful"
+        if [ "$RESTORE_HAD_ERRORS" -eq 0 ]; then
+            show_success "Restore Complete!\nCustom plugins and ScriptUI Panels restored."
+            show_notification "Restore Successful"
+        else
+            show_alert "Restore finished with errors.\nSome items failed - check the Terminal output."
+        fi
     fi
 }
 
@@ -598,16 +676,20 @@ case "${1:-}" in
         if [ -n "${2:-}" ]; then
             ADOBE_BACKUP_SELECTION_FILE="$2"
         fi
+        BACKUP_HAD_ERRORS=0
         ADOBE_BACKUP_HEADLESS=true do_backup
-        exit 0
+        [ "$BACKUP_HAD_ERRORS" -eq 0 ]
+        exit $?
         ;;
     --restore-headless)
         if [ -z "${2:-}" ]; then
             echo "Restore source is required."
             exit 1
         fi
+        RESTORE_HAD_ERRORS=0
         ADOBE_BACKUP_HEADLESS=true do_restore_from_source "$2"
-        exit 0
+        [ "$RESTORE_HAD_ERRORS" -eq 0 ]
+        exit $?
         ;;
 esac
 
