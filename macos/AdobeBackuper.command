@@ -50,7 +50,7 @@ function shell_quote() {
 
 function run_admin_cmd() {
     local cmd="$1"
-    osascript <<'APPLESCRIPT' "$cmd"
+    osascript <<'APPLESCRIPT' - "$cmd"
 on run argv
   set cmd to item 1 of argv
   do shell script cmd with administrator privileges
@@ -303,18 +303,18 @@ function show_backup_preview() {
         "$SCAN_ITEM_COUNT" "$SCAN_TOTAL_FILES" "$total_size" "$CURRENT_BACKUP_FOLDER"
 
     while IFS=$'\t' read -r category source destination files bytes; do
-        if [ "$shown" -ge 8 ]; then
+        if [ "$shown" -ge 5 ]; then
             preview="${preview}"$'\n'"...and more locations in Terminal output."
             break
         fi
 
-        printf -v line '\n%s\n%s / %s files\nFrom: %s\nTo: %s\n' \
-            "$category" "$(format_bytes "$bytes")" "$files" "$source" "$destination"
+        printf -v line '\n%s (%s / %s files)\n%s\n' \
+            "$category" "$(format_bytes "$bytes")" "$files" "$source"
         preview="${preview}${line}"
         shown=$((shown + 1))
     done < "$SCAN_REPORT_FILE"
 
-    osascript <<'APPLESCRIPT' "$preview"
+    osascript <<'APPLESCRIPT' - "$preview"
 on run argv
   set previewText to item 1 of argv
   set answer to display dialog previewText buttons {"Cancel", "Backup"} default button "Backup" with icon note
